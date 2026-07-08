@@ -1,0 +1,8 @@
+# broker-map 需要的套件。安裝：pip install -r requirements.txt
+# 安裝若報錯，把錯誤訊息全文貼給 Claude。
+pandas
+duckdb
+streamlit
+requests
+jupyter
+matplotlib

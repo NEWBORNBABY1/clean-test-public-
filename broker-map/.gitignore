@@ -1,0 +1,17 @@
+# --- 秘密：token 絕不進版控 ---
+.env
+
+# --- L1 清理層：資料庫是可重建的產物，不進版控 ---
+#     （驗收條件之一就是刪掉它能重建）
+brokers.duckdb
+
+# --- L0 原始層：抓回來的大檔不進版控，但保留資料夾結構 ---
+data/raw/*
+!data/raw/.gitkeep
+
+# --- Python 雜物 ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
