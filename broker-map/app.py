@@ -1,10 +1,8 @@
 """
-app.py — Streamlit 網頁介面。只做一件事：把資料庫的內容變成可查詢的畫面。
+app.py — Streamlit 網頁介面。只做一件事：把 brokers.duckdb 變成可查詢的畫面。
 
-為什麼對 brokers.duckdb「只讀不寫」？
-- 畫面壞掉，跟資料壞掉，是兩回事。UI 只負責「呈現」，
-  改版面時絕不會動到辛苦清好的資料。
-- read_only=True 從程式層面保證這件事——就算寫錯程式也寫不進去。
+對資料庫「只讀不寫」：read_only=True 從程式層面保證改版面不會動到資料。
+核心查的是 v_chain（分點→總公司→母集團 寬表，build_db 建好的）。
 
 啟動：streamlit run app.py   （停止：回終端機按 Ctrl+C）
 """
@@ -20,85 +18,48 @@ DB_PATH = BASE / "brokers.duckdb"
 
 @st.cache_resource
 def get_con():
-    """開一條唯讀連線。@st.cache_resource = 連線只開一次、之後重複用，
-    不然 Streamlit 每次畫面刷新都會重跑整支程式、狂開連線。"""
     if not DB_PATH.exists():
         return None
     return duckdb.connect(str(DB_PATH), read_only=True)
 
 
-def table_exists(con, name: str) -> bool:
-    """問資料庫「有沒有這張表」。traders 要等 fetch.py 跑過才存在，先問再查才不會炸。"""
-    row = con.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [name]
-    ).fetchone()
-    return row is not None
-
-
 def main():
     st.set_page_config(page_title="broker-map", page_icon="📈")
     st.title("台灣券商關係查詢")
-
     con = get_con()
     if con is None:
-        st.warning("還沒有 brokers.duckdb。請先在終端機跑 `python build_db.py`。")
+        st.warning("還沒有 brokers.duckdb。請先在終端機跑 `python fetch.py` 再 `python build_db.py`。")
         return
 
-    keyword = st.text_input("輸入券商名稱、集團名或代碼")
-    if not keyword:
-        st.info("例：輸入「元大」→ 顯示 總公司 → 母集團 鏈、同集團全部成員、期貨 IB 對照。")
+    kw = st.text_input("輸入分點 / 總公司 / 集團 任一關鍵字（例：元大、元大-松江、開發金）")
+    if not kw:
+        st.info("輸入後顯示：完整 分點→總公司→母集團 鏈，以及同集團的全部分點。")
         return
+    pat = f"%{kw.strip()}%"  # 參數化查詢：使用者輸入永遠只當「資料」，不會變成 SQL 指令
 
-    # 查詢鐵律：使用者輸入一律用 ? 佔位符傳進去（參數化查詢），
-    # 絕不用字串拼 SQL。拼字串的話，有心人輸入一段 SQL 就能對資料庫為所欲為
-    # （SQL injection）；參數化讓輸入永遠只是「資料」，不可能變成「指令」。
-    pattern = f"%{keyword.strip()}%"   # 前後加 % = SQL 的「包含」比對
-
-    # --- 1) 總公司 → 母集團 ---
+    # 1) 命中的分點（分點名/總公司/母集團 任一含關鍵字）
     hits = con.execute(
-        "SELECT firm AS 總公司, group_name AS 母集團 "
-        "FROM firm_to_group WHERE firm LIKE ? OR group_name LIKE ?",
-        [pattern, pattern],
+        "SELECT 分點代碼, 分點, 總公司, 母集團, 地址 FROM v_chain "
+        "WHERE 分點 LIKE ? OR 總公司 LIKE ? OR 母集團 LIKE ? LIMIT 500",
+        [pat, pat, pat],
     ).df()
-    st.subheader("總公司 → 母集團")
+    st.subheader(f"符合「{kw}」的分點（{len(hits)} 筆）")
     if hits.empty:
-        st.write("手工表裡沒有符合的。firm_to_group.csv 還很小，查不到就是該去補表了。")
-    else:
-        st.dataframe(hits, use_container_width=True)
+        st.write("查無資料。")
+        return
+    st.dataframe(hits, use_container_width=True, hide_index=True)
 
-        # --- 2) 同集團全部成員：先收集命中的集團，再反查所有成員 ---
-        groups = hits["母集團"].unique().tolist()
-        placeholders = ",".join("?" for _ in groups)  # 幾個集團就生出幾個 ?
-        members = con.execute(
-            f"SELECT group_name AS 母集團, firm AS 成員 "
-            f"FROM firm_to_group WHERE group_name IN ({placeholders}) "
-            f"ORDER BY group_name, firm",
+    # 2) 同集團全部分點：把命中的母集團收集起來，反查整個集團有多少分點
+    groups = [g for g in hits["母集團"].dropna().unique().tolist()]
+    if groups:
+        ph = ",".join("?" for _ in groups)
+        fam = con.execute(
+            f"SELECT 母集團, 總公司, COUNT(*) AS 分點數 FROM v_chain "
+            f"WHERE 母集團 IN ({ph}) GROUP BY 母集團, 總公司 ORDER BY 母集團, 分點數 DESC",
             groups,
         ).df()
-        st.subheader("同集團全部成員")
-        st.dataframe(members, use_container_width=True)
-
-    # --- 3) 期貨商 ↔ 交易輔助人(IB) ---
-    fut = con.execute(
-        "SELECT futures_firm AS 期貨商, ib AS 交易輔助人 "
-        "FROM futures_ib WHERE futures_firm LIKE ? OR ib LIKE ?",
-        [pattern, pattern],
-    ).df()
-    if not fut.empty:
-        st.subheader("期貨商 ↔ 交易輔助人(IB)")
-        st.dataframe(fut, use_container_width=True)
-
-    # --- 4) FinMind 券商基本資料（traders 表要 fetch.py + build_db.py 跑過才有）---
-    if table_exists(con, "traders"):
-        traders = con.execute(
-            "SELECT * FROM traders WHERE name LIKE ? OR code LIKE ? LIMIT 100",
-            [pattern, pattern],
-        ).df()
-        if not traders.empty:
-            st.subheader("券商基本資料（FinMind）")
-            st.dataframe(traders, use_container_width=True)
-    else:
-        st.caption("尚未匯入 FinMind 券商資料：跑過 fetch.py + build_db.py 後，這裡會多一區。")
+        st.subheader("同集團版圖（各總公司分點數）")
+        st.dataframe(fam, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

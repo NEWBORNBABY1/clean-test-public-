@@ -1,17 +1,20 @@
 """
-build_db.py — 只做一件事：讀 L0 原始層 → 清理 → 寫進 L1 資料庫 (brokers.duckdb)。
+build_db.py — 只做一件事：讀 L0 → 清理、推導關係 → 寫進 brokers.duckdb。
 
-為什麼要有這一支、而且跟 fetch.py 分開？
-- 「抓」和「清理」是兩種不同的失敗：抓失敗是網路/API 的事，
-  清理失敗是格式/邏輯的事。分開才好抓 bug、好重跑。
-- 這一支「只讀 L0、只寫 DuckDB」。它不碰網路，可以離線一直重跑，
-  改清理邏輯不必再打一次 API——這就是分層的好處。
-- 驗收條件之一：刪掉 brokers.duckdb 後重跑能完整重建。
-  能重建，是因為原始資料都還在 L0。
+這支是本專案的核心，做三件事：
+  1. 讀證交所兩份 L0：總公司(heads)、分點(branches)。
+  2. **推導 分點→總公司**：分點名格式「總公司-分點」（如「元大-松江」），
+     取名稱前綴對回總公司名。長名優先比對，臺銀證券等差字的用別名表補。
+  3. 讀手工表 firm_to_group（總公司→母集團，這層只有人知道，無 API），
+     建 VIEW v_chain 把整條「分點→總公司→母集團」串成一張寬表給 app 查。
 
-資料流：data/raw/*.json + data/manual/*.csv ──build_db.py──▶ brokers.duckdb ──▶ app.py 查詢
+為什麼跟 fetch 分開？抓是網路的事、清理是邏輯的事，分開才好各自重跑。
+這支不碰網路，可離線一直重跑；改推導邏輯不必再抓一次。
+
+資料流：data/raw/*.json + data/manual/firm_to_group.csv ──▶ brokers.duckdb（含 v_chain）
 """
 
+import html
 import json
 from pathlib import Path
 
@@ -23,74 +26,84 @@ RAW_DIR = BASE / "data" / "raw"
 MANUAL_DIR = BASE / "data" / "manual"
 DB_PATH = BASE / "brokers.duckdb"
 
+# 分點名開頭與總公司名對不上的少數例外，在這裡補別名（分點前綴 -> 總公司名）
+# 來源命名不一致：麥格理/麥格里、台中銀/台中商銀、臺銀/臺銀證券。
+ALIASES = {"臺銀": "臺銀證券", "犇亞": "犇亞證券", "香港商麥格里": "港商麥格理",
+           "麥格里": "港商麥格理", "台中商銀": "台中銀"}
+
+
+def normalize(s: str) -> str:
+    """統一字面：解 HTML 實體（犇→&#29319;）、去空白、臺↔台 視為同字。"""
+    return html.unescape(s).replace(" ", "").replace("臺", "台")
+
+
+def latest(prefix: str) -> Path:
+    """取某來源最新一份 L0 快照。檔名帶 ISO 日期，字串排序=日期排序，取最後一個。"""
+    files = sorted(RAW_DIR.glob(f"{prefix}_*.json"))
+    if not files:
+        raise SystemExit(f"找不到 {prefix}_*.json——請先跑 python fetch.py")
+    return files[-1]
+
 
 def read_manual_csv(name: str) -> pd.DataFrame:
-    """讀手工維護的小表。comment='#' 讓 CSV 裡的 # 註解行不被當成資料。"""
     df = pd.read_csv(MANUAL_DIR / name, comment="#")
-    # 去掉前後空白，避免「元大證券 」和「元大證券」被當成兩家——清理層的基本功
-    return df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+    return df.apply(lambda c: c.str.strip() if c.dtype == "object" else c)
 
 
-def load_trader_info() -> pd.DataFrame | None:
-    """把 L0 最新一份 trader_info 快照讀成乾淨的 DataFrame。沒抓過就回 None。
-
-    清理層在這裡做三件事：
-      1. 挑「最新」快照——sorted() 對「名字_2026-07-08.json」這種格式
-         按字串排序剛好就是按日期排序（這是檔名帶 ISO 日期的隱藏好處）。
-      2. 原始 JSON → 表格（FinMind 把資料放在 "data" 欄位裡）。
-      3. 欄名統一成我們自己的規格：code / name。
-         上游想叫什麼隨它，進了 L1 一律說我們的語言——之後 app 只認 code/name。
-    """
-    files = sorted(RAW_DIR.glob("trader_info_*.json"))
-    if not files:
-        return None
-    latest = files[-1]
-    print(f"[讀入] L0 快照：{latest.name}")
-    obj = json.loads(latest.read_text(encoding="utf-8"))
-    df = pd.DataFrame(obj["data"])
-    df = df.rename(columns={
-        "securities_trader_id": "code",
-        "securities_trader": "name",
-    })
-    # 只留存在的欄位（API 欄位可能增減，防呆）
-    keep = [c for c in ("code", "name", "date", "address", "phone") if c in df.columns]
-    return df[keep]
+def derive_head(branch_name: str, head_names: list[str]) -> str | None:
+    """從分點名推出總公司名。head_names 需長名在前，避免「兆豐」誤吃更長的名。"""
+    clean = normalize(branch_name)
+    for h in head_names:
+        if clean.startswith(normalize(h)):
+            return h
+    for alias, real in ALIASES.items():
+        if clean.startswith(normalize(alias)):
+            return real
+    return None
 
 
 def build() -> None:
-    print("=== build_db.py 開始：讀 L0 → 清理 → 寫 DuckDB ===")
+    print("=== build_db.py 開始：讀 L0 → 推導關係 → 寫 DuckDB ===")
 
-    # --- 手工兩張表：現在就能入庫，不必等 fetch ---
-    firm_to_group = read_manual_csv("firm_to_group.csv")
-    # 「group」是 SQL 保留字（GROUP BY 的那個 group），直接當欄名會跟資料庫吵架。
-    # 清理層的職責之一：把名字改成不會惹麻煩的 group_name。
-    firm_to_group = firm_to_group.rename(columns={"group": "group_name"})
-    futures_ib = read_manual_csv("futures_ib.csv")
-    print(f"[讀入] firm_to_group：{len(firm_to_group)} 筆")
-    print(f"[讀入] futures_ib：{len(futures_ib)} 筆")
+    heads = pd.DataFrame(json.loads(latest("heads").read_text(encoding="utf-8")))
+    heads = heads.rename(columns={"Code": "code", "Name": "name",
+                                  "Address": "address", "Telephone": "phone"})
+    branch_raw = json.loads(latest("branches").read_text(encoding="utf-8"))
+    branches = pd.DataFrame(branch_raw).rename(columns={
+        "證券商代號": "code", "證券商名稱": "name", "地址": "address", "電話": "phone"})
+    branches["name"] = branches["name"].apply(html.unescape)  # 解掉來源的 HTML 實體（如 犇）
 
-    # --- FinMind 券商資料：抓過才有 ---
-    traders = load_trader_info()
+    # 推導 分點→總公司（長名優先）
+    head_names = sorted(heads["name"].tolist(), key=len, reverse=True)
+    branches["head_name"] = branches["name"].apply(lambda n: derive_head(n, head_names))
+    matched = branches["head_name"].notna().sum()
+    print(f"[讀入] 總公司 {len(heads)}、分點 {len(branches)}")
+    print(f"[推導] 分點→總公司：對到 {matched}、對不到 {len(branches) - matched}")
+
+    firm_to_group = read_manual_csv("firm_to_group.csv").rename(columns={"group": "group_name"})
+    print(f"[讀入] firm_to_group：{len(firm_to_group)} 筆（總公司→母集團，手工維護）")
 
     con = duckdb.connect(str(DB_PATH))
     try:
-        # register 讓 DuckDB 把 pandas DataFrame 直接當表查
-        con.register("firm_to_group_df", firm_to_group)
-        con.register("futures_ib_df", futures_ib)
-        con.execute("CREATE OR REPLACE TABLE firm_to_group AS SELECT * FROM firm_to_group_df")
-        con.execute("CREATE OR REPLACE TABLE futures_ib AS SELECT * FROM futures_ib_df")
-        tables = ["firm_to_group", "futures_ib"]
+        for tname, df in [("heads", heads), ("branches", branches),
+                          ("firm_to_group", firm_to_group)]:
+            con.register(f"{tname}_df", df)
+            con.execute(f"CREATE OR REPLACE TABLE {tname} AS SELECT * FROM {tname}_df")
 
-        if traders is not None:
-            con.register("traders_df", traders)
-            con.execute("CREATE OR REPLACE TABLE traders AS SELECT * FROM traders_df")
-            tables.append(f"traders({len(traders)} 筆)")
-        else:
-            print("[略過] 還沒有 FinMind 原始檔——先跑 python fetch.py 再回來，traders 表才會出現。")
-
-        print(f"[完成] 已寫入 brokers.duckdb：{'、'.join(tables)}")
+        # v_chain：分點 → 總公司 → 母集團，一張寬表。LEFT JOIN 讓對不到集團的分點也留著。
+        con.execute("""
+            CREATE OR REPLACE VIEW v_chain AS
+            SELECT b.code AS 分點代碼, b.name AS 分點, b.head_name AS 總公司,
+                   g.group_name AS 母集團, b.address AS 地址
+            FROM branches b
+            LEFT JOIN firm_to_group g ON b.head_name = g.firm
+            ORDER BY b.head_name, b.code
+        """)
+        n = con.execute("SELECT COUNT(*) FROM v_chain WHERE 母集團 IS NOT NULL").fetchone()[0]
+        print(f"[完成] brokers.duckdb 已建：heads、branches、firm_to_group、v_chain")
+        print(f"       其中 {n} 個分點已補上母集團（其餘待 firm_to_group 補齊）")
     finally:
-        con.close()  # 一定要關，不然檔案被鎖住，app.py 會打不開
+        con.close()
 
 
 if __name__ == "__main__":
